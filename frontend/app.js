@@ -42,6 +42,20 @@ imperialBtn.addEventListener('click', function() {
     weightInput.max = '660';
 });
 
+// Cycling checkbox toggle
+const hasCyclingCheckbox = document.getElementById('hasCycling');
+const cyclingDetails = document.getElementById('cyclingDetails');
+
+hasCyclingCheckbox.addEventListener('change', function() {
+    if (this.checked) {
+        cyclingDetails.classList.remove('hidden');
+    } else {
+        cyclingDetails.classList.add('hidden');
+        // Clear cycling inputs when unchecked
+        document.getElementById('cyclingRides').value = '';
+    }
+});
+
 document.getElementById('fitnessForm').addEventListener('submit', async function(e) {
     e.preventDefault();
 
@@ -70,10 +84,31 @@ document.getElementById('fitnessForm').addEventListener('submit', async function
         measurement_system: measurementSystem
     };
 
+    // Add cycling data if checkbox is checked
+    const hasCycling = document.getElementById('hasCycling').checked;
+    if (hasCycling) {
+        const cyclingRides = document.getElementById('cyclingRides').value;
+        formData.cycling = {
+            enabled: true,
+            rides_per_year: cyclingRides ? parseInt(cyclingRides) : 0,
+            season: "April - November"
+        };
+    } else {
+        formData.cycling = {
+            enabled: false
+        };
+    }
+
+    // Add current routine if provided
+    const currentRoutine = document.getElementById('currentRoutine').value.trim();
+    if (currentRoutine) {
+        formData.current_routine = currentRoutine;
+    }
+
     try {
         const API_URL = window.location.hostname === 'localhost' 
             ? 'http://localhost:8080/generate' 
-            : '/generate';
+            : 'https://smart-coach-service-277077304112.us-central1.run.app/generate';
             
         const response = await fetch(API_URL, {
             method: 'POST',
@@ -108,8 +143,10 @@ document.getElementById('fitnessForm').addEventListener('submit', async function
                 badgesContainer.innerHTML += badge;
             });
         }
-        // Parse Markdown to HTML
-        document.getElementById('planContent').innerHTML = marked.parse(data.plan);
+        // Parse Markdown to HTML and enhance with structured exercise layout
+        let planHTML = marked.parse(data.plan);
+        planHTML = enhanceWorkoutDisplay(planHTML);
+        document.getElementById('planContent').innerHTML = planHTML;
 
         // UI State: Show Result
         loading.classList.add('hidden');
@@ -121,3 +158,75 @@ document.getElementById('fitnessForm').addEventListener('submit', async function
         location.reload();
     }
 });
+
+// Function to enhance workout display with structured layout
+function enhanceWorkoutDisplay(htmlContent) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(htmlContent, 'text/html');
+    
+    // Find all list items (exercises)
+    const listItems = doc.querySelectorAll('li');
+    
+    listItems.forEach(li => {
+        const text = li.innerHTML;
+        
+        // Check if this is an exercise line (contains strong/bold tags)
+        const strongTags = li.querySelectorAll('strong, b');
+        
+        if (strongTags.length > 0) {
+            // Get exercise name from first strong tag
+            const exerciseName = strongTags[0].textContent.trim();
+            
+            // Look for any YouTube link
+            const linkElement = li.querySelector('a[href*="youtube.com"]');
+            let videoId = null;
+            
+            if (linkElement) {
+                const href = linkElement.getAttribute('href');
+                const match = href.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
+                if (match) {
+                    videoId = match[1];
+                }
+            }
+            
+            // Get exercise details (everything after the exercise name, excluding the video link)
+            let details = text
+                .replace(/<strong>.*?<\/strong>/gi, '')
+                .replace(/<b>.*?<\/b>/gi, '')
+                .replace(/<a[^>]*>.*?<\/a>/gi, '')
+                .replace(/[-–—]\s*$/, '')
+                .trim();
+            
+            // Remove leading dash if present
+            details = details.replace(/^[-–—]\s*/, '').trim();
+            
+            // Create structured HTML
+            let structuredHTML = `
+                <div class="exercise-row">
+                    <div class="exercise-info">
+                        <span class="exercise-name">${exerciseName}</span>
+                        <span class="exercise-details">${details}</span>
+                    </div>
+            `;
+            
+            // Add video thumbnail if available
+            if (videoId) {
+                const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
+                structuredHTML += `
+                    <div class="exercise-video">
+                        <a href="https://youtube.com/watch?v=${videoId}" target="_blank" class="video-link">
+                            <img src="${thumbnailUrl}" alt="${exerciseName} Demo" class="video-thumbnail">
+                            <div class="play-overlay">▶</div>
+                        </a>
+                    </div>
+                `;
+            }
+            
+            structuredHTML += `</div>`;
+            li.innerHTML = structuredHTML;
+            li.classList.add('exercise-item');
+        }
+    });
+    
+    return doc.body.innerHTML;
+}

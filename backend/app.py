@@ -25,6 +25,7 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 MODEL_PATH = os.path.join(DATA_DIR, 'workout_classifier.pkl')
 TRAINING_DATA_PATH = os.path.join(DATA_DIR, 'X_train.pkl')
 EXERCISE_PATH = os.path.join(DATA_DIR, 'exercises.json')
+EXERCISE_VIDEOS_PATH = os.path.join(DATA_DIR, 'exercise_videos.json')
 
 # --- DEFINITIONS & MAPPINGS ---
 # We define these globally so they are available for LIME and the API
@@ -70,6 +71,10 @@ explainer = LimeTabularExplainer(
 with open(EXERCISE_PATH, 'r') as f:
     EXERCISE_DB = json.load(f)
 
+# Load curated exercise video database
+with open(EXERCISE_VIDEOS_PATH, 'r') as f:
+    EXERCISE_VIDEOS = json.load(f)
+
 # Load Gemini
 api_key = os.getenv("GEMINI_API_KEY")
 
@@ -95,6 +100,50 @@ def calculate_duration(experience_years, goal):
             return "4-6 Weeks (Peaking Cycle)"
         else:
             return "4-6 Weeks (Prevent Adaptation)"
+
+def add_exercise_videos(workout_plan_text):
+    """
+    Scans the workout plan for exercise names and adds verified YouTube links.
+    Uses the curated EXERCISE_VIDEOS database for reliable links.
+    """
+    import re
+    
+    # Find all exercise mentions (typically after "**" in markdown)
+    # Pattern: looks for exercise names in bold markdown format
+    lines = workout_plan_text.split('\n')
+    updated_lines = []
+    
+    for line in lines:
+        # Check if line contains an exercise (has ** and looks like an exercise line)
+        if '**' in line and ('set' in line.lower() or 'rep' in line.lower() or line.strip().startswith('-') or line.strip().startswith('*')):
+            # Extract exercise name (between ** **)
+            match = re.search(r'\*\*(.*?)\*\*', line)
+            if match:
+                exercise_name = match.group(1).lower().strip()
+                
+                # Skip if this looks like a header (all caps, has "Day", etc.)
+                if any(keyword in exercise_name.lower() for keyword in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'day ', 'rest', 'cardio session']):
+                    updated_lines.append(line)
+                    continue
+                
+                # Check if we have a video for this exercise
+                video_id = EXERCISE_VIDEOS.get(exercise_name)
+                
+                # If not found, try partial matching (e.g., "dumbbell bench press" contains "bench press")
+                if not video_id:
+                    for key, vid in EXERCISE_VIDEOS.items():
+                        if key in exercise_name or exercise_name in key:
+                            video_id = vid
+                            break
+                
+                # Add video link if found and not already present
+                if video_id and '[📹]' not in line and 'youtube.com' not in line:
+                    # Insert video link after the exercise name
+                    line = line.replace(match.group(0), f"{match.group(0)} [📹](https://youtube.com/watch?v={video_id})")
+        
+        updated_lines.append(line)
+    
+    return '\n'.join(updated_lines)
 
 def clean_lime_feature(lime_rule, all_columns):
     """
@@ -124,6 +173,18 @@ def get_gemini_response(split_name, user_data, explanation_text):
     height_str = f"{user_data['height']}{user_data['height_unit']}"
     weight_str = f"{user_data['weight']}{user_data['weight_unit']}"
 
+    # Build cycling context if enabled
+    cycling_context = ""
+    if user_data.get('cycling', {}).get('enabled', False):
+        rides = user_data['cycling'].get('rides_per_year', 0)
+        season = user_data['cycling'].get('season', 'April - November')
+        cycling_context = f"\n- Cycling Activity: {rides} rides/year during {season} (account for lower body recovery needs on weekends during season)"
+
+    # Build current routine context if provided
+    routine_context = ""
+    if user_data.get('current_routine'):
+        routine_context = f"\n\nCURRENT ROUTINE (analyze and provide feedback):\n{user_data['current_routine']}\n\nProvide specific feedback on their current routine: what's working well, what could be improved, and how the new plan addresses any gaps or imbalances."
+
     prompt = f"""
     You are an expert fitness coach. Create a weekly workout plan for a client.
     
@@ -132,18 +193,25 @@ def get_gemini_response(split_name, user_data, explanation_text):
     - Height: {height_str} | Weight: {weight_str}
     - Experience: {user_data['experience_years']} years
     - Goal: {user_data['goal']} | Days: {user_data['days_available']}
-    - Environment: {user_data['environment_str']}
+    - Environment: {user_data['environment_str']}{cycling_context}
     - Assigned Structure: {split_name}
     
     AI REASONING CONTEXT:
     The classifier chose this split because: {explanation_text}
+    {routine_context}
     
     INSTRUCTIONS:
     1. Start with a 1-sentence "Coach's Insight" explaining WHY this split was chosen (use the AI Reasoning Context).
     2. Write a 7-day schedule based on "{split_name}".
-    3. Use ONLY equipment matching "{user_data['environment_str']}".
-    4. Format output as clean Markdown.
-    5. Menu: {exercise_context}
+    3. For EACH exercise, use this format:
+       - **Exercise Name** - Sets x Reps, Rest time
+    4. Use ONLY equipment matching "{user_data['environment_str']}".
+    5. Format output as clean Markdown with proper day headers.
+    6. Example format:
+       **Monday - Upper Body**
+       - **Bench Press** - 3 sets x 8-10 reps, 90s rest
+       - **Barbell Rows** - 3 sets x 8-10 reps, 90s rest
+    7. Available exercises: {exercise_context}
     """
 
     try:
@@ -152,7 +220,12 @@ def get_gemini_response(split_name, user_data, explanation_text):
 
         if response.text:
             print(f"Response text length: {len(response.text)} chars")
-            return response.text
+            # Add verified video links to the exercises
+            enhanced_plan = add_exercise_videos(response.text)
+            print(f"=== SAMPLE OUTPUT (first 500 chars) ===")
+            print(enhanced_plan[:500])
+            print(f"=== END SAMPLE ===")
+            return enhanced_plan
         else:
             error_msg = f"Error: Blocked by Gemini. Reason: {response.candidates[0].finish_reason}"
             print(error_msg)
@@ -190,6 +263,16 @@ def generate_plan():
         # Store original values for display
         data['height'] = height
         data['weight'] = weight
+        
+        # Extract cycling info if provided
+        cycling_data = data.get('cycling', {})
+        if cycling_data.get('enabled', False):
+            data['cycling'] = cycling_data
+        
+        # Extract current routine if provided
+        current_routine = data.get('current_routine', '').strip()
+        if current_routine:
+            data['current_routine'] = current_routine
         
         goal_enum = GOAL_MAPPING.get(data['goal'].lower(), 0)
         gender_enum = GENDER_MAPPING.get(data['gender'].lower(), 0)
@@ -252,6 +335,17 @@ def generate_plan():
     except Exception as e:
         print(e)
         return jsonify({"error": str(e)}), 500
+
+@app.route('/exercises', methods=['GET'])
+def get_exercises():
+    """
+    Returns the list of exercises with available video demonstrations.
+    Useful for debugging and transparency.
+    """
+    return jsonify({
+        "total_exercises": len(EXERCISE_VIDEOS),
+        "exercises": sorted(list(EXERCISE_VIDEOS.keys()))
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)
